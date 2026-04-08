@@ -25,11 +25,11 @@ Download the latest binary for your platform from the
 
 | Platform | File |
 |----------|------|
-| Linux x86_64 (musl, static) | `cveseek-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 (musl, static) | `cveseek-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
-| macOS Intel | `cveseek-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `cveseek-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `cveseek-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (static) | `cveseek-vX.Y.Z-linux-x64.tar.gz` |
+| Linux ARM64 (static) | `cveseek-vX.Y.Z-linux-arm64.tar.gz` |
+| macOS Intel | `cveseek-vX.Y.Z-macos-x64.tar.gz` |
+| macOS Apple Silicon | `cveseek-vX.Y.Z-macos-arm64.tar.gz` |
+| Windows x86_64 | `cveseek-vX.Y.Z-windows-x64.exe` |
 
 Each archive contains a single self-contained binary — no runtime dependencies.
 SHA-256 checksums are provided alongside every archive.
@@ -37,8 +37,8 @@ SHA-256 checksums are provided alongside every archive.
 **Quick install on Linux/macOS:**
 ```bash
 # Replace vX.Y.Z and the target triple with your platform
-curl -LO https://github.com/xtncl/cveseek/releases/latest/download/cveseek-v0.1.0-x86_64-unknown-linux-musl.tar.gz
-tar xzf cveseek-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/xtncl/cveseek/releases/latest/download/cveseek-v0.1.0-linux-x64.tar.gz
+tar xzf cveseek-v0.1.0-linux-x64.tar.gz
 sudo mv cveseek /usr/local/bin/
 ```
 
