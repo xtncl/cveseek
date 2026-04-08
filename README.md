@@ -1,27 +1,31 @@
 # cveseek
 
+[![Crates.io](https://img.shields.io/crates/v/cveseek)](https://crates.io/crates/cveseek)
+[![Build](https://github.com/xtncl/cveseek/actions/workflows/release.yml/badge.svg)](https://github.com/xtncl/cveseek/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/xtncl/cveseek/releases/latest)
+
 A fast, keyboard-driven terminal UI for searching and browsing CVE vulnerabilities using the [NIST NVD API](https://nvd.nist.gov/developers/vulnerabilities).
 
 <!-- TODO: add demo gif -->
 
 ## Features
 
-- **Full-text search** against the NVD database
-- **Two-pane layout** — CVE list + detailed preview, switchable with arrow keys
-- **CPE product filter** with live fuzzy search (`f`)
-- **CVSS scoring** with color-coded severity (CRITICAL / HIGH / MEDIUM / LOW)
-- **CWE weaknesses**, affected products, references — all in the preview pane
-- **Extra columns** (Published, Modified, Status) when preview is hidden
-- **Interactive query input** — start without arguments and type your search
-- **New search** without restarting the app (`s`)
-- Zero external dependencies beyond `cargo`
+- Full-text search against the NVD database
+- Two-pane layout with CVE list and detailed preview, switchable with arrow keys
+- CPE product filter with live fuzzy search (`f`)
+- CVSS scoring with color-coded severity (CRITICAL / HIGH / MEDIUM / LOW)
+- CWE weaknesses, affected products and references in the preview pane
+- Extra columns (Published, Modified, Status) when the preview is hidden
+- Interactive query input: start without arguments and type your search
+- New search without restarting (`s`)
+- No external dependencies beyond `cargo`
 
 ## Installation
 
-### Pre-built binaries (recommended)
+### Pre-built binaries
 
-Download the latest binary for your platform from the
-[GitHub Releases page](https://github.com/xtncl/cveseek/releases/latest):
+Download the latest binary for your platform from the [releases page](https://github.com/xtncl/cveseek/releases/latest):
 
 | Platform | File |
 |----------|------|
@@ -31,12 +35,10 @@ Download the latest binary for your platform from the
 | macOS Apple Silicon | `cveseek-vX.Y.Z-macos-arm64.tar.gz` |
 | Windows x86_64 | `cveseek-vX.Y.Z-windows-x64.exe` |
 
-Each archive contains a single self-contained binary — no runtime dependencies.
 SHA-256 checksums are provided alongside every archive.
 
-**Quick install on Linux/macOS:**
+**Linux/macOS quick install:**
 ```bash
-# Replace vX.Y.Z and the target triple with your platform
 curl -LO https://github.com/xtncl/cveseek/releases/latest/download/cveseek-v0.1.0-linux-x64.tar.gz
 tar xzf cveseek-v0.1.0-linux-x64.tar.gz
 sudo mv cveseek /usr/local/bin/
@@ -60,13 +62,13 @@ cargo build --release
 ## Usage
 
 ```bash
-# Interactive mode (type your query in the TUI)
+# Interactive mode
 cveseek
 
 # Direct search
 cveseek -q "windows server 2022"
 
-# With NVD API key (higher rate limits — free at https://nvd.nist.gov/developers/request-an-api-key)
+# With NVD API key (free at https://nvd.nist.gov/developers/request-an-api-key)
 cveseek -q "openssl" --key YOUR_API_KEY
 
 # API key via environment variable
@@ -83,7 +85,7 @@ cveseek -q "nginx"
 | `↑` / `↓` or `j` / `k` | Navigate CVE list |
 | `→` | Focus preview pane |
 | `←` | Focus back to list |
-| `↑` / `↓` (preview focused) | Scroll preview |
+| `↑` / `↓` (in preview) | Scroll preview |
 | `PgUp` / `PgDn` | Jump 15 entries |
 | `g` / `G` | First / last entry |
 | `Ctrl+U` / `Ctrl+D` | Scroll preview fast |
@@ -115,12 +117,12 @@ cveseek -q "nginx"
 
 ## API Key
 
-Without an API key, the NVD API is rate-limited to ~5 requests per 30 seconds. For regular use, get a free key at:
+Without an API key the NVD API is rate-limited to ~5 requests per 30 seconds. For regular use, get a free key at:
 
 https://nvd.nist.gov/developers/request-an-api-key
 
-Set it via `--key` flag or `$NVD_API_KEY` environment variable.
+Set it via `--key` or the `$NVD_API_KEY` environment variable.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT - see [LICENSE](LICENSE)
