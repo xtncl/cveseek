@@ -10,10 +10,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
     Frame, Terminal,
 };
 use serde::Deserialize;
@@ -74,12 +74,12 @@ struct NvdResponse {
     vulnerabilities: Vec<VulnEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct VulnEntry {
     cve: CveItem,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CveItem {
     id: String,
     published: String,
@@ -99,13 +99,13 @@ struct CveItem {
     configurations: Vec<Configuration>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Description {
     lang: String,
     value: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 struct Metrics {
     #[serde(rename = "cvssMetricV31", default)]
     v31: Vec<CvssMetric>,
@@ -115,13 +115,13 @@ struct Metrics {
     v2: Vec<CvssMetricV2>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CvssMetric {
     #[serde(rename = "cvssData")]
     data: CvssData,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CvssData {
     #[serde(rename = "baseScore")]
     base_score: f64,
@@ -145,7 +145,7 @@ struct CvssData {
     availability_impact: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CvssMetricV2 {
     #[serde(rename = "cvssData")]
     data: CvssDataV2,
@@ -153,7 +153,7 @@ struct CvssMetricV2 {
     base_severity: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CvssDataV2 {
     #[serde(rename = "baseScore")]
     base_score: f64,
@@ -161,30 +161,30 @@ struct CvssDataV2 {
     vector_string: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Weakness {
     #[serde(default)]
     description: Vec<Description>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Reference {
     url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Configuration {
     #[serde(default)]
     nodes: Vec<Node>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Node {
     #[serde(rename = "cpeMatch", default)]
     cpe_match: Vec<CpeMatch>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct CpeMatch {
     vulnerable: bool,
     criteria: String,
@@ -468,16 +468,209 @@ fn html_to_lines(html: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     lines
 }
 
+// ── Filter Overlay ────────────────────────────────────────────────────────────
+
+struct FilterOverlay {
+    products: Vec<String>,
+    checked: Vec<bool>,
+    include_no_cpe: bool,
+    /// Index within visible_items(), not the full list.
+    cursor: usize,
+    /// Scroll offset within visible_items().
+    list_scroll: usize,
+    focus_confirm: bool,
+    search_query: String,
+    search_mode: bool,
+}
+
+impl FilterOverlay {
+    fn new(products: Vec<String>) -> Self {
+        let n = products.len();
+        FilterOverlay {
+            products,
+            checked: vec![true; n],
+            include_no_cpe: true,
+            cursor: 0,
+            list_scroll: 0,
+            focus_confirm: false,
+            search_query: String::new(),
+            search_mode: false,
+        }
+    }
+
+    fn item_count(&self) -> usize {
+        self.products.len() + 1
+    }
+
+    /// Indices into the full item list that match the current search query.
+    /// Index products.len() represents the "no CPE" entry.
+    fn visible_items(&self) -> Vec<usize> {
+        if self.search_query.is_empty() {
+            (0..self.item_count()).collect()
+        } else {
+            let q = self.search_query.to_lowercase();
+            let mut v: Vec<usize> = self.products
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect();
+            if "(cves without product info)".contains(&q) {
+                v.push(self.products.len());
+            }
+            v
+        }
+    }
+
+    fn clamp_cursor(&mut self) {
+        let len = self.visible_items().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i64) {
+        if self.focus_confirm {
+            if delta < 0 {
+                self.focus_confirm = false;
+                let len = self.visible_items().len();
+                self.cursor = len.saturating_sub(1);
+            }
+            return;
+        }
+        let vis_len = self.visible_items().len();
+        if vis_len == 0 {
+            return;
+        }
+        let max = vis_len as i64 - 1;
+        let cur = self.cursor as i64;
+        let new = (cur + delta).max(0).min(max);
+        if delta > 0 && cur == max {
+            self.focus_confirm = true;
+        } else {
+            self.cursor = new as usize;
+        }
+    }
+
+    fn toggle_current(&mut self) {
+        if self.focus_confirm {
+            return;
+        }
+        let vis = self.visible_items();
+        if vis.is_empty() {
+            return;
+        }
+        let real = vis[self.cursor];
+        if real < self.products.len() {
+            self.checked[real] = !self.checked[real];
+        } else {
+            self.include_no_cpe = !self.include_no_cpe;
+        }
+        // Advance to next item automatically.
+        if self.cursor + 1 < vis.len() {
+            self.cursor += 1;
+        }
+    }
+
+    fn select_all(&mut self) {
+        if self.search_query.is_empty() {
+            for c in &mut self.checked {
+                *c = true;
+            }
+            self.include_no_cpe = true;
+        } else {
+            for &real in &self.visible_items() {
+                if real < self.products.len() {
+                    self.checked[real] = true;
+                } else {
+                    self.include_no_cpe = true;
+                }
+            }
+        }
+    }
+
+    fn select_none(&mut self) {
+        if self.search_query.is_empty() {
+            for c in &mut self.checked {
+                *c = false;
+            }
+            self.include_no_cpe = false;
+        } else {
+            for &real in &self.visible_items() {
+                if real < self.products.len() {
+                    self.checked[real] = false;
+                } else {
+                    self.include_no_cpe = false;
+                }
+            }
+        }
+    }
+
+    /// Called from the renderer with the actual viewport height so scroll
+    /// can be adjusted symmetrically (padding above and below cursor).
+    fn adjust_scroll(&mut self, visible_height: usize) {
+        const PAD: usize = 3;
+        let vis_len = self.visible_items().len();
+        if vis_len == 0 || visible_height == 0 {
+            self.list_scroll = 0;
+            return;
+        }
+        // Cursor too close to top → scroll up.
+        if self.cursor < self.list_scroll + PAD {
+            self.list_scroll = self.cursor.saturating_sub(PAD);
+        }
+        // Cursor too close to bottom → scroll down.
+        if visible_height > 0 && self.cursor + PAD + 1 > self.list_scroll + visible_height {
+            self.list_scroll = self.cursor + PAD + 1 - visible_height;
+        }
+        // Never scroll past the end.
+        let max_scroll = vis_len.saturating_sub(visible_height);
+        self.list_scroll = self.list_scroll.min(max_scroll);
+    }
+
+    fn tab_confirm(&mut self) {
+        self.focus_confirm = !self.focus_confirm;
+    }
+
+    fn search_push(&mut self, c: char) {
+        self.search_query.push(c);
+        self.clamp_cursor();
+    }
+
+    fn search_pop(&mut self) {
+        self.search_query.pop();
+        self.clamp_cursor();
+    }
+
+    fn enter_search(&mut self) {
+        self.search_mode = true;
+        self.focus_confirm = false;
+    }
+
+    fn exit_search(&mut self, clear: bool) {
+        self.search_mode = false;
+        if clear {
+            self.search_query.clear();
+        }
+        self.clamp_cursor();
+    }
+}
+
 // ── App State ─────────────────────────────────────────────────────────────────
 
 enum AppState {
     Loading { tick: u8 },
     Error(String),
     Loaded {
+        all_cves: Vec<VulnEntry>,
         cves: Vec<VulnEntry>,
         total: u32,
         table_state: TableState,
         preview_scroll: u16,
+        filter_overlay: FilterOverlay,
+        filter_open: bool,
     },
 }
 
@@ -509,18 +702,24 @@ impl App {
     fn poll_fetch(&mut self) {
         if let Ok(FetchMsg::Done(result)) = self.rx.try_recv() {
             match result {
-                Ok((mut cves, total)) => {
+                Ok((mut all_cves, total)) => {
                     // Newest published date first
-                    cves.sort_by(|a, b| b.cve.published.cmp(&a.cve.published));
+                    all_cves.sort_by(|a, b| b.cve.published.cmp(&a.cve.published));
                     let mut ts = TableState::default();
-                    if !cves.is_empty() {
+                    if !all_cves.is_empty() {
                         ts.select(Some(0));
                     }
+                    let products = collect_all_products(&all_cves);
+                    let filter_overlay = FilterOverlay::new(products);
+                    let cves = all_cves.clone();
                     self.state = AppState::Loaded {
+                        all_cves,
                         cves,
                         total,
                         table_state: ts,
                         preview_scroll: 0,
+                        filter_overlay,
+                        filter_open: false,
                     };
                 }
                 Err(e) => {
@@ -588,9 +787,153 @@ impl App {
             }
         }
     }
+
+    fn toggle_filter(&mut self) {
+        if let AppState::Loaded { filter_open, .. } = &mut self.state {
+            *filter_open = !*filter_open;
+        }
+    }
+
+    fn filter_move_cursor(&mut self, delta: i64) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.move_cursor(delta);
+            }
+        }
+    }
+
+    fn filter_toggle(&mut self) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.toggle_current();
+            }
+        }
+    }
+
+    fn filter_select_all(&mut self) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.select_all();
+            }
+        }
+    }
+
+    fn filter_select_none(&mut self) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.select_none();
+            }
+        }
+    }
+
+    fn filter_tab(&mut self) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.tab_confirm();
+            }
+        }
+    }
+
+    fn filter_search_enter(&mut self) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.enter_search();
+            }
+        }
+    }
+
+    fn filter_search_exit(&mut self, clear: bool) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.exit_search(clear);
+            }
+        }
+    }
+
+    fn filter_search_push(&mut self, c: char) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.search_push(c);
+            }
+        }
+    }
+
+    fn filter_search_pop(&mut self) {
+        if let AppState::Loaded { filter_open, filter_overlay, .. } = &mut self.state {
+            if *filter_open {
+                filter_overlay.search_pop();
+            }
+        }
+    }
+
+    fn apply_filter(&mut self) {
+        if let AppState::Loaded {
+            all_cves,
+            cves,
+            filter_overlay,
+            filter_open,
+            table_state,
+            preview_scroll,
+            ..
+        } = &mut self.state
+        {
+            let selected: std::collections::HashSet<String> = filter_overlay
+                .products
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| filter_overlay.checked[*i])
+                .map(|(_, p)| p.clone())
+                .collect();
+            let include_no_cpe = filter_overlay.include_no_cpe;
+            let all_checked = filter_overlay.checked.iter().all(|&c| c) && include_no_cpe;
+
+            if all_checked {
+                *cves = all_cves.clone();
+            } else {
+                *cves = all_cves
+                    .iter()
+                    .filter(|entry| {
+                        let products = get_products(&entry.cve);
+                        if products.is_empty() {
+                            include_no_cpe
+                        } else {
+                            products.iter().any(|p| {
+                                let base = p.splitn(2, ' ').next().unwrap_or(p);
+                                selected.contains(base)
+                            })
+                        }
+                    })
+                    .cloned()
+                    .collect();
+            }
+
+            *filter_open = false;
+            let mut ts = TableState::default();
+            if !cves.is_empty() {
+                ts.select(Some(0));
+            }
+            *table_state = ts;
+            *preview_scroll = 0;
+        }
+    }
 }
 
-// ── Fetch ─────────────────────────────────────────────────────────────────────
+// ── Fetch + Helpers ───────────────────────────────────────────────────────────
+
+fn collect_all_products(all_cves: &[VulnEntry]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for entry in all_cves {
+        for p in get_products(&entry.cve) {
+            let base = p.splitn(2, ' ').next().unwrap_or(&p).to_string();
+            if seen.insert(base.clone()) {
+                out.push(base);
+            }
+        }
+    }
+    out.sort();
+    out
+}
 
 fn fetch_cves(query: &str, api_key: &str) -> Result<(Vec<VulnEntry>, u32), String> {
     let encoded = urlencoding::encode(query);
@@ -655,7 +998,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Style::default().fg(C_HEADER),
             ),
             Span::styled(
-                "  [↑↓/jk] nav  [PgUp/PgDn] page  [g/G] top/bot  [^d/^u] scroll preview  [q] quit",
+                "  [↑↓/jk] nav  [PgUp/PgDn] page  [g/G] top/bot  [^d/^u] scroll preview  [f] filter  [q] quit",
                 Style::default().fg(C_DIM),
             ),
         ]),
@@ -687,6 +1030,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             cves,
             table_state,
             preview_scroll,
+            filter_open,
+            filter_overlay,
             ..
         } => {
             if cves.is_empty() {
@@ -698,6 +1043,9 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .style(Style::default().fg(C_DIM)),
                     layout[1],
                 );
+                if *filter_open {
+                    render_filter_overlay(f, area, filter_overlay);
+                }
                 return;
             }
 
@@ -708,6 +1056,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             render_list(f, body_chunks[0], cves, table_state);
             render_preview(f, body_chunks[1], cves, table_state.selected(), *preview_scroll);
+
+            if *filter_open {
+                render_filter_overlay(f, area, filter_overlay);
+            }
         }
     }
 }
@@ -1009,6 +1361,199 @@ fn render_preview(
     f.render_widget(paragraph, inner);
 }
 
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn render_filter_overlay(f: &mut Frame, area: Rect, overlay: &mut FilterOverlay) {
+
+    let popup_area = centered_rect(72, 78, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_HEADER))
+        .title(Span::styled(
+            " Filter by Product ",
+            Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    if inner.height < 6 || inner.width < 20 {
+        return;
+    }
+
+    // Layout: hint | search | separator | list | separator | confirm
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hints
+            Constraint::Length(1), // search bar
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // separator
+            Constraint::Length(1), // confirm
+        ])
+        .split(inner);
+
+    // Hint line
+    let hint = Line::from(vec![
+        Span::styled("[a]", Style::default().fg(C_YELLOW)),
+        Span::styled(" all  ", Style::default().fg(C_DIM)),
+        Span::styled("[n]", Style::default().fg(C_YELLOW)),
+        Span::styled(" none  ", Style::default().fg(C_DIM)),
+        Span::styled("[Space]", Style::default().fg(C_YELLOW)),
+        Span::styled(" toggle  ", Style::default().fg(C_DIM)),
+        Span::styled("[Tab]", Style::default().fg(C_YELLOW)),
+        Span::styled(" confirm  ", Style::default().fg(C_DIM)),
+        Span::styled("[Esc]", Style::default().fg(C_YELLOW)),
+        Span::styled(" cancel", Style::default().fg(C_DIM)),
+    ]);
+    f.render_widget(Paragraph::new(hint), chunks[0]);
+
+    // Search bar
+    let search_line = if overlay.search_mode {
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(overlay.search_query.as_str(), Style::default().fg(C_DEFAULT)),
+            Span::styled("█", Style::default().fg(C_DIM)),
+        ])
+    } else if !overlay.search_query.is_empty() {
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(C_DIM)),
+            Span::styled(overlay.search_query.as_str(), Style::default().fg(C_YELLOW)),
+            Span::styled("  [/] edit  [Esc in search] clear", Style::default().fg(C_DIM)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "[/] search",
+            Style::default().fg(C_DIM),
+        ))
+    };
+    f.render_widget(Paragraph::new(search_line), chunks[1]);
+
+    let sep_str = "─".repeat(inner.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            sep_str.clone(),
+            Style::default().fg(C_BORDER),
+        ))),
+        chunks[2],
+    );
+
+    // Scrollable product list
+    let visible = chunks[3].height as usize;
+    overlay.adjust_scroll(visible);
+    let vis_items = overlay.visible_items();
+    let total_vis = vis_items.len();
+    let scroll_offset = if overlay.focus_confirm { 0 } else { overlay.list_scroll };
+
+    let mut lines: Vec<Line> = vec![];
+    let end = (scroll_offset + visible).min(total_vis);
+    for vis_idx in scroll_offset..end {
+        let is_cursor = !overlay.focus_confirm && vis_idx == overlay.cursor;
+        let real = vis_items[vis_idx];
+        let (checked, label) = if real < overlay.products.len() {
+            (overlay.checked[real], overlay.products[real].as_str())
+        } else {
+            (overlay.include_no_cpe, "(CVEs without product info)")
+        };
+
+        let prefix = if is_cursor { "▶ " } else { "  " };
+        let checkbox = if checked { "[x] " } else { "[ ] " };
+
+        let row_style = if is_cursor {
+            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DEFAULT)
+        };
+        let check_style = if checked {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+
+        // Highlight matching part of label when searching
+        if !overlay.search_query.is_empty() && !is_cursor {
+            let q = overlay.search_query.to_lowercase();
+            let label_lower = label.to_lowercase();
+            if let Some(pos) = label_lower.find(&q) {
+                let max_w = chunks[3].width.saturating_sub(6) as usize;
+                let before = truncate_str(&label[..pos], max_w);
+                let matched = &label[pos..pos + q.len()];
+                let after_start = pos + q.len();
+                let after = if after_start < label.len() {
+                    truncate_str(&label[after_start..], max_w.saturating_sub(before.len() + matched.len()))
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), row_style),
+                    Span::styled(checkbox.to_string(), check_style),
+                    Span::styled(before, Style::default().fg(C_DEFAULT)),
+                    Span::styled(matched.to_string(), Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+                    Span::styled(after, Style::default().fg(C_DEFAULT)),
+                ]));
+                continue;
+            }
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), row_style),
+            Span::styled(checkbox.to_string(), check_style),
+            Span::styled(
+                truncate_str(label, chunks[3].width.saturating_sub(6) as usize),
+                row_style,
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[3]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            sep_str,
+            Style::default().fg(C_BORDER),
+        ))),
+        chunks[4],
+    );
+
+    // Confirm button (right-aligned)
+    let (confirm_label, confirm_style) = if overlay.focus_confirm {
+        (
+            "[ Confirm ]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(C_HEADER)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("  Confirm  ", Style::default().fg(C_HEADER))
+    };
+    let pad = (inner.width as usize).saturating_sub(confirm_label.len());
+    let confirm_line = Line::from(vec![
+        Span::styled(" ".repeat(pad), Style::default()),
+        Span::styled(confirm_label, confirm_style),
+    ]);
+    f.render_widget(Paragraph::new(confirm_line), chunks[5]);
+}
+
 fn abbrev(s: &str) -> &str {
     match s {
         "NETWORK" => "NET",
@@ -1052,18 +1597,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _)
-                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_cursor(-1),
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_cursor(1),
-                    (KeyCode::PageUp, _) => app.move_cursor(-15),
-                    (KeyCode::PageDown, _) => app.move_cursor(15),
-                    (KeyCode::Char('g'), _) => app.goto_first(),
-                    (KeyCode::Char('G'), _) => app.goto_last(),
-                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.scroll_preview(8),
-                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.scroll_preview(-8),
-                    _ => {}
+                let filter_open =
+                    matches!(&app.state, AppState::Loaded { filter_open: true, .. });
+                let search_mode = if let AppState::Loaded { filter_open: true, filter_overlay, .. } =
+                    &app.state
+                {
+                    filter_overlay.search_mode
+                } else {
+                    false
+                };
+
+                if filter_open && search_mode {
+                    match key.code {
+                        KeyCode::Esc => app.filter_search_exit(true),
+                        KeyCode::Enter => app.filter_search_exit(false),
+                        KeyCode::Backspace => app.filter_search_pop(),
+                        KeyCode::Up => app.filter_move_cursor(-1),
+                        KeyCode::Down => app.filter_move_cursor(1),
+                        KeyCode::Char(c) => app.filter_search_push(c),
+                        _ => {}
+                    }
+                } else if filter_open {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('q'), _)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                        (KeyCode::Esc, _) | (KeyCode::Char('f'), _) => app.toggle_filter(),
+                        (KeyCode::Char('/'), _) => app.filter_search_enter(),
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                            app.filter_move_cursor(-1)
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                            app.filter_move_cursor(1)
+                        }
+                        (KeyCode::Char(' '), _) => app.filter_toggle(),
+                        (KeyCode::Char('a'), _) => app.filter_select_all(),
+                        (KeyCode::Char('n'), _) => app.filter_select_none(),
+                        (KeyCode::Tab, _) => app.filter_tab(),
+                        (KeyCode::Enter, _) => app.apply_filter(),
+                        _ => {}
+                    }
+                } else {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('q'), _)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_cursor(-1),
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_cursor(1),
+                        (KeyCode::PageUp, _) => app.move_cursor(-15),
+                        (KeyCode::PageDown, _) => app.move_cursor(15),
+                        (KeyCode::Char('g'), _) => app.goto_first(),
+                        (KeyCode::Char('G'), _) => app.goto_last(),
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.scroll_preview(8),
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.scroll_preview(-8),
+                        (KeyCode::Char('f'), _) => app.toggle_filter(),
+                        _ => {}
+                    }
                 }
             }
         }
