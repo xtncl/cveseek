@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -45,9 +45,14 @@ impl Cli {
                     }
                 }
                 "-h" | "--help" => {
-                    eprintln!("Usage: cveseek [-q <search term>] [-k <nvd-api-key>]");
-                    eprintln!("  -q, --query  Search query (optional; interactive if omitted)");
-                    eprintln!("  -k, --key    NVD API key (optional; also $NVD_API_KEY)");
+                    eprintln!("cveseek {} — NVD CVE search TUI", env!("CARGO_PKG_VERSION"));
+                    eprintln!("by Christian Lepuschitz (@xtncl) — https://github.com/xtncl/cveseek");
+                    eprintln!();
+                    eprintln!("Usage: cveseek [-q <query>] [-k <api-key>]");
+                    eprintln!("  -q, --query  Keyword search query (interactive if omitted)");
+                    eprintln!("  -k, --key    NVD API key (also $NVD_API_KEY)");
+                    eprintln!();
+                    eprintln!("Press [?] inside the app for more information.");
                     std::process::exit(0);
                 }
                 _ => {}
@@ -187,6 +192,80 @@ struct CpeMatch {
     #[serde(rename = "versionEndExcluding", default)]
     version_end_excluding: String,
 }
+
+// ── CPE types (for product search) ───────────────────────────────────────────
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CpeType { Os, Hardware, Application, Unknown }
+
+impl CpeType {
+    fn from_part(part: &str) -> Self {
+        match part { "o" => Self::Os, "h" => Self::Hardware, "a" => Self::Application, _ => Self::Unknown }
+    }
+    fn badge(&self) -> &'static str {
+        match self { Self::Os => "[OS] ", Self::Hardware => "[HW] ", Self::Application => "[App]", Self::Unknown => "[?]  " }
+    }
+    fn badge_color(&self) -> Color {
+        match self {
+            Self::Os          => Color::Rgb(195, 232, 141),
+            Self::Hardware    => Color::Rgb(130, 170, 255),
+            Self::Application => Color::Rgb(255, 199, 119),
+            Self::Unknown     => Color::Rgb(99, 109, 166),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NvdCpeResponse {
+    products: Vec<NvdCpeProduct>,
+}
+
+#[derive(Deserialize)]
+struct NvdCpeProduct { cpe: NvdCpe }
+
+#[derive(Deserialize)]
+struct NvdCpe {
+    #[serde(rename = "cpeName")]
+    cpe_name: String,
+    #[serde(default)]
+    titles: Vec<CpeApiTitle>,
+    #[serde(default)]
+    deprecated: bool,
+}
+
+#[derive(Deserialize)]
+struct CpeApiTitle { title: String, lang: String }
+
+#[derive(Clone)]
+struct CpeEntry {
+    cpe_name: String,
+    vendor: String,
+    product: String,
+    title: String,
+    kind: CpeType,
+}
+
+impl CpeEntry {
+    fn from_api(raw: &NvdCpe) -> Self {
+        let parts: Vec<&str> = raw.cpe_name.split(':').collect();
+        let kind    = CpeType::from_part(parts.get(2).copied().unwrap_or(""));
+        let vendor  = parts.get(3).copied().unwrap_or("").to_string();
+        let product = parts.get(4).copied().unwrap_or("").to_string();
+        let title   = raw.titles.iter()
+            .find(|t| t.lang == "en")
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| format!("{}: {}", vendor, product));
+        CpeEntry { cpe_name: raw.cpe_name.clone(), vendor, product, title, kind }
+    }
+
+    fn display_label(&self) -> String {
+        if self.title.is_empty() { format!("{}: {}", self.vendor, self.product) }
+        else { self.title.clone() }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SearchMode { Keyword, Cpe }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -466,6 +545,7 @@ fn html_to_lines(html: &str, width: usize, base: Style) -> Vec<Line<'static>> {
 
 struct FilterOverlay {
     products: Vec<String>,
+    kinds: Vec<CpeType>,
     checked: Vec<bool>,
     include_no_cpe: bool,
     /// Index within visible_items(), not the full list.
@@ -478,10 +558,11 @@ struct FilterOverlay {
 }
 
 impl FilterOverlay {
-    fn new(products: Vec<String>) -> Self {
+    fn new_with_kinds(products: Vec<String>, kinds: Vec<CpeType>) -> Self {
         let n = products.len();
         FilterOverlay {
             products,
+            kinds,
             checked: vec![true; n],
             include_no_cpe: true,
             cursor: 0,
@@ -652,14 +733,126 @@ impl FilterOverlay {
     }
 }
 
+// ── CPE Overlay (for product-first search) ────────────────────────────────────
+
+struct CpeOverlay {
+    entries: Vec<CpeEntry>,
+    checked: Vec<bool>,
+    cursor: usize,
+    list_scroll: usize,
+    search_query: String,
+    search_mode: bool,
+}
+
+impl CpeOverlay {
+    fn new(mut entries: Vec<CpeEntry>, query: &str) -> Self {
+        let q = query.to_lowercase();
+        entries.sort_by(|a, b| {
+            cpe_relevance_tier(a, &q).cmp(&cpe_relevance_tier(b, &q))
+                .then(a.kind.cmp(&b.kind))
+                .then(a.vendor.to_lowercase().cmp(&b.vendor.to_lowercase()))
+                .then(a.product.to_lowercase().cmp(&b.product.to_lowercase()))
+        });
+        let n = entries.len();
+        CpeOverlay { entries, checked: vec![false; n], cursor: 0, list_scroll: 0,
+            search_query: String::new(), search_mode: false }
+    }
+
+    fn select_all(&mut self) {
+        if self.search_query.is_empty() {
+            for c in &mut self.checked { *c = true; }
+        } else {
+            for &i in &self.visible_items() { self.checked[i] = true; }
+        }
+    }
+
+    fn select_none(&mut self) {
+        if self.search_query.is_empty() {
+            for c in &mut self.checked { *c = false; }
+        } else {
+            for &i in &self.visible_items() { self.checked[i] = false; }
+        }
+    }
+
+    fn visible_items(&self) -> Vec<usize> {
+        if self.search_query.is_empty() {
+            (0..self.entries.len()).collect()
+        } else {
+            let q = self.search_query.to_lowercase();
+            self.entries.iter().enumerate()
+                .filter(|(_, e)| {
+                    e.display_label().to_lowercase().contains(&q)
+                        || e.vendor.to_lowercase().contains(&q)
+                        || e.product.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        }
+    }
+
+    fn clamp_cursor(&mut self) {
+        let len = self.visible_items().len();
+        if len == 0 { self.cursor = 0; }
+        else if self.cursor >= len { self.cursor = len - 1; }
+    }
+
+    fn move_cursor(&mut self, delta: i64) {
+        let vis_len = self.visible_items().len();
+        if vis_len == 0 { return; }
+        let new = (self.cursor as i64 + delta).max(0).min(vis_len as i64 - 1);
+        self.cursor = new as usize;
+    }
+
+    fn toggle_current(&mut self) {
+        let vis = self.visible_items();
+        if vis.is_empty() { return; }
+        let real = vis[self.cursor];
+        self.checked[real] = !self.checked[real];
+        if self.cursor + 1 < vis.len() { self.cursor += 1; }
+    }
+
+    fn adjust_scroll(&mut self, visible_height: usize) {
+        const PAD: usize = 3;
+        let vis_len = self.visible_items().len();
+        if vis_len == 0 || visible_height == 0 { self.list_scroll = 0; return; }
+        if self.cursor < self.list_scroll + PAD {
+            self.list_scroll = self.cursor.saturating_sub(PAD);
+        }
+        if self.cursor + PAD + 1 > self.list_scroll + visible_height {
+            self.list_scroll = self.cursor + PAD + 1 - visible_height;
+        }
+        self.list_scroll = self.list_scroll.min(vis_len.saturating_sub(visible_height));
+    }
+
+    fn selected_cpe_names(&self) -> Vec<String> {
+        self.entries.iter().enumerate()
+            .filter(|(i, _)| self.checked[*i])
+            .map(|(_, e)| e.cpe_name.clone())
+            .collect()
+    }
+
+    fn has_selection(&self) -> bool { self.checked.iter().any(|&c| c) }
+
+    fn search_push(&mut self, c: char) { self.search_query.push(c); self.clamp_cursor(); }
+    fn search_pop(&mut self) { self.search_query.pop(); self.clamp_cursor(); }
+    fn enter_search(&mut self) { self.search_mode = true; }
+    fn exit_search(&mut self, clear: bool) {
+        self.search_mode = false;
+        if clear { self.search_query.clear(); }
+        self.clamp_cursor();
+    }
+}
+
 // ── App State ─────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
 enum PaneFocus { List, Preview }
 
 enum AppState {
-    QueryInput { input: String },
+    QueryInput { input: String, mode: SearchMode },
     Loading { tick: u8 },
+    CpeLoading { query: String, tick: u8 },
+    CpeResults { query: String, overlay: CpeOverlay, status_line: String },
     Error(String),
     Loaded {
         all_cves: Vec<VulnEntry>,
@@ -677,6 +870,7 @@ enum AppState {
 
 enum FetchMsg {
     Done(Result<(Vec<VulnEntry>, u32), String>),
+    CpeDone(Result<Vec<CpeEntry>, String>),
 }
 
 struct App {
@@ -684,6 +878,7 @@ struct App {
     api_key: String,
     state: AppState,
     rx: Option<mpsc::Receiver<FetchMsg>>,
+    show_about: bool,
 }
 
 impl App {
@@ -701,6 +896,7 @@ impl App {
             api_key,
             state: AppState::Loading { tick: 0 },
             rx: Some(rx),
+            show_about: false,
         }
     }
 
@@ -709,9 +905,30 @@ impl App {
         App {
             query: String::new(),
             api_key,
-            state: AppState::QueryInput { input: String::new() },
+            state: AppState::QueryInput { input: String::new(), mode: SearchMode::Keyword },
             rx: None,
+            show_about: false,
         }
+    }
+
+    /// Fire a CPE keyword search from the interactive screen.
+    fn submit_cpe_search(&mut self, query: String) {
+        let (tx, rx) = mpsc::channel();
+        let q = query.clone();
+        let k = self.api_key.clone();
+        thread::spawn(move || { let _ = tx.send(FetchMsg::CpeDone(fetch_cpes(&q, &k))); });
+        self.state = AppState::CpeLoading { query, tick: 0 };
+        self.rx = Some(rx);
+    }
+
+    /// Fire a CVE search by CPE name(s) after user selects from the overlay.
+    fn submit_cpe_query(&mut self, cpe_names: Vec<String>, label: String) {
+        let (tx, rx) = mpsc::channel();
+        let k = self.api_key.clone();
+        thread::spawn(move || { let _ = tx.send(FetchMsg::Done(fetch_cves_by_cpe(&cpe_names, &k))); });
+        self.query = label;
+        self.state = AppState::Loading { tick: 0 };
+        self.rx = Some(rx);
     }
 
     /// Submit the query typed in the interactive input screen.
@@ -730,42 +947,53 @@ impl App {
 
     fn poll_fetch(&mut self) {
         if let Some(rx) = &self.rx {
-        if let Ok(FetchMsg::Done(result)) = rx.try_recv() {
-            match result {
-                Ok((mut all_cves, total)) => {
-                    // Newest published date first
-                    all_cves.sort_by(|a, b| b.cve.published.cmp(&a.cve.published));
-                    let mut ts = TableState::default();
-                    if !all_cves.is_empty() {
-                        ts.select(Some(0));
+            match rx.try_recv() {
+                Ok(FetchMsg::Done(result)) => {
+                    match result {
+                        Ok((mut all_cves, total)) => {
+                            all_cves.sort_by(|a, b| b.cve.published.cmp(&a.cve.published));
+                            let mut ts = TableState::default();
+                            if !all_cves.is_empty() { ts.select(Some(0)); }
+                            let filter_overlay = collect_all_products(&all_cves);
+                            let cves = all_cves.clone();
+                            self.state = AppState::Loaded {
+                                all_cves, cves, total, table_state: ts, preview_scroll: 0,
+                                filter_overlay, filter_open: false, focus: PaneFocus::List,
+                                preview_open: true, search_input: None,
+                            };
+                        }
+                        Err(e) => { self.state = AppState::Error(e); }
                     }
-                    let products = collect_all_products(&all_cves);
-                    let filter_overlay = FilterOverlay::new(products);
-                    let cves = all_cves.clone();
-                    self.state = AppState::Loaded {
-                        all_cves,
-                        cves,
-                        total,
-                        table_state: ts,
-                        preview_scroll: 0,
-                        filter_overlay,
-                        filter_open: false,
-                        focus: PaneFocus::List,
-                        preview_open: true,
-                        search_input: None,
-                    };
                 }
-                Err(e) => {
-                    self.state = AppState::Error(e);
+                Ok(FetchMsg::CpeDone(result)) => {
+                    match result {
+                        Ok(entries) => {
+                            let query = match &self.state {
+                                AppState::CpeLoading { query, .. } => query.clone(),
+                                _ => String::new(),
+                            };
+                            let status = format!("{} products found", entries.len());
+                            let overlay = CpeOverlay::new(entries, &query);
+                            self.state = AppState::CpeResults {
+                                query,
+                                overlay,
+                                status_line: status,
+                            };
+                        }
+                        Err(e) => { self.state = AppState::Error(e); }
+                    }
                 }
+                Err(_) => {}
             }
-        }
         }
     }
 
     fn tick(&mut self) {
-        if let AppState::Loading { tick } = &mut self.state {
-            *tick = tick.wrapping_add(1);
+        match &mut self.state {
+            AppState::Loading { tick } | AppState::CpeLoading { tick, .. } => {
+                *tick = tick.wrapping_add(1);
+            }
+            _ => {}
         }
     }
 
@@ -1001,40 +1229,140 @@ impl App {
 
 // ── Fetch + Helpers ───────────────────────────────────────────────────────────
 
-fn collect_all_products(all_cves: &[VulnEntry]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = vec![];
+fn cpe_relevance_tier(e: &CpeEntry, q: &str) -> u8 {
+    if e.vendor.to_lowercase() == q || e.product.to_lowercase() == q { 0 }
+    else if e.vendor.to_lowercase().contains(q) || e.product.to_lowercase().contains(q)
+        || e.display_label().to_lowercase().contains(q) { 1 }
+    else { 2 }
+}
+
+fn parse_cpe_part(criteria: &str) -> CpeType {
+    let parts: Vec<&str> = criteria.split(':').collect();
+    CpeType::from_part(parts.get(2).copied().unwrap_or(""))
+}
+
+fn collect_all_products(all_cves: &[VulnEntry]) -> FilterOverlay {
+    let mut seen: std::collections::HashMap<String, CpeType> = std::collections::HashMap::new();
     for entry in all_cves {
-        for p in get_products(&entry.cve) {
-            let base = p.splitn(2, ' ').next().unwrap_or(&p).to_string();
-            if seen.insert(base.clone()) {
-                out.push(base);
+        for cfg in &entry.cve.configurations {
+            for node in &cfg.nodes {
+                for cpe in &node.cpe_match {
+                    if !cpe.vulnerable { continue; }
+                    let parts: Vec<&str> = cpe.criteria.split(':').collect();
+                    if parts.len() < 5 { continue; }
+                    let base = format!("{}:{}", parts[3], parts[4]);
+                    seen.entry(base).or_insert_with(|| parse_cpe_part(&cpe.criteria));
+                }
             }
         }
     }
-    out.sort();
-    out
+    // Sort by (kind, product key) so OS appears first
+    let mut pairs: Vec<(String, CpeType)> = seen.into_iter().collect();
+    pairs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let products: Vec<String> = pairs.iter().map(|(p, _)| p.clone()).collect();
+    let kinds: Vec<CpeType> = pairs.into_iter().map(|(_, k)| k).collect();
+    FilterOverlay::new_with_kinds(products, kinds)
+}
+
+const NVD_PAGE_SIZE: u32 = 2000;
+
+fn nvd_get(url: &str, api_key: &str) -> Result<NvdResponse, String> {
+    let mut req = ureq::get(url).set("User-Agent", "cveseek/1.0");
+    if !api_key.is_empty() { req = req.set("apiKey", api_key); }
+    req.call()
+        .map_err(|e| format!("Request failed: {}", e))?
+        .into_json::<NvdResponse>()
+        .map_err(|e| format!("Parse error: {}", e))
+}
+
+/// Fetch the most recent CVEs for a base URL (no pagination params).
+/// If totalResults > PAGE_SIZE, fetches the last page so the user sees
+/// the newest CVEs instead of the oldest.
+fn fetch_recent(base_url: &str, api_key: &str) -> Result<(Vec<VulnEntry>, u32), String> {
+    let url = format!("{}&resultsPerPage={}", base_url, NVD_PAGE_SIZE);
+    let body = nvd_get(&url, api_key)?;
+    let total = body.total_results;
+    if total <= NVD_PAGE_SIZE {
+        return Ok((body.vulnerabilities, total));
+    }
+    // Fetch last page — contains the most recently published CVEs
+    let start = total - NVD_PAGE_SIZE;
+    let url2 = format!("{}&resultsPerPage={}&startIndex={}", base_url, NVD_PAGE_SIZE, start);
+    let body2 = nvd_get(&url2, api_key)?;
+    Ok((body2.vulnerabilities, total))
 }
 
 fn fetch_cves(query: &str, api_key: &str) -> Result<(Vec<VulnEntry>, u32), String> {
     let encoded = urlencoding::encode(query);
+    let base = format!("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}", encoded);
+    fetch_recent(&base, api_key)
+}
+
+fn fetch_cpes(query: &str, api_key: &str) -> Result<Vec<CpeEntry>, String> {
+    let encoded = urlencoding::encode(query);
     let url = format!(
-        "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}",
+        "https://services.nvd.nist.gov/rest/json/cpes/2.0?keywordSearch={}",
         encoded
     );
     let mut req = ureq::get(&url).set("User-Agent", "cveseek/1.0");
     if !api_key.is_empty() {
         req = req.set("apiKey", api_key);
     }
-    let resp = req
-        .call()
-        .map_err(|e| format!("Request failed: {}", e))?;
+    let resp = req.call().map_err(|e| format!("CPE request failed: {}", e))?;
+    let body: NvdCpeResponse = resp.into_json().map_err(|e| format!("CPE parse error: {}", e))?;
 
-    let body: NvdResponse = resp
-        .into_json()
-        .map_err(|e| format!("Parse error: {}", e))?;
+    // Deduplicate by (vendor, product, kind): keep wildcard-version entry if available,
+    // otherwise the first seen. This removes hundreds of per-version entries.
+    let mut seen: std::collections::HashMap<(String, String), CpeEntry> =
+        std::collections::HashMap::new();
+    for raw in &body.products {
+        if raw.cpe.deprecated { continue; }
+        let entry = CpeEntry::from_api(&raw.cpe);
+        let parts: Vec<&str> = raw.cpe.cpe_name.split(':').collect();
+        let version = parts.get(5).copied().unwrap_or("*");
+        let is_wildcard = version == "*" || version == "-";
+        let key = (entry.vendor.clone(), entry.product.clone());
+        match seen.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => { e.insert(entry); }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if is_wildcard { *e.get_mut() = entry; }
+            }
+        }
+    }
+    Ok(seen.into_values().collect())
+}
 
-    Ok((body.vulnerabilities, body.total_results))
+fn fetch_cves_by_cpe(cpe_names: &[String], api_key: &str) -> Result<(Vec<VulnEntry>, u32), String> {
+    let mut all: Vec<VulnEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total: u32 = 0;
+    for cpe_name in cpe_names {
+        if api_key.is_empty() { thread::sleep(Duration::from_millis(650)); }
+        let encoded = urlencoding::encode(cpe_name);
+        let base = format!("https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName={}", encoded);
+        let (entries, count) = fetch_recent(&base, api_key)?;
+        total = total.saturating_add(count);
+        for entry in entries {
+            if seen.insert(entry.cve.id.clone()) { all.push(entry); }
+        }
+    }
+    Ok((all, total))
+}
+
+fn build_cpe_label(overlay: &CpeOverlay) -> String {
+    let selected: Vec<&CpeEntry> = overlay.entries.iter().enumerate()
+        .filter(|(i, _)| overlay.checked[*i])
+        .map(|(_, e)| e)
+        .collect();
+    match selected.len() {
+        0 => String::new(),
+        1 => format!("{} ({})", selected[0].display_label(), selected[0].kind.badge().trim()),
+        2 => format!("{} ({}), {} ({})",
+            selected[0].display_label(), selected[0].kind.badge().trim(),
+            selected[1].display_label(), selected[1].kind.badge().trim()),
+        n => format!("{} ({}) + {} more",
+            selected[0].display_label(), selected[0].kind.badge().trim(), n - 1),
+    }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -1051,6 +1379,8 @@ const C_SEL_BG: Color = Color::Rgb(45, 63, 118);   // #2d3f76  selection
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.size();
 
+    'draw: {
+
     // Vertical split: header (1 line) + body
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1059,15 +1389,37 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // ── Header bar ──────────────────────────────────────────────────────────
     let header_text = match &app.state {
-        AppState::QueryInput { .. } => Line::from(vec![
+        AppState::QueryInput { mode, .. } => Line::from(vec![
             Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
-            Span::styled("NVD Vulnerability Search", Style::default().fg(C_DIM)),
+            Span::styled(
+                if *mode == SearchMode::Keyword { "Keyword Search" } else { "Product Search (CPE)" },
+                Style::default().fg(C_DIM),
+            ),
         ]),
         AppState::Loading { .. } => Line::from(vec![
             Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
             Span::styled("query: ", Style::default().fg(C_HEADER)),
             Span::styled(app.query.as_str(), Style::default().fg(C_DEFAULT)),
             Span::styled("  fetching...", Style::default().fg(C_DIM)),
+        ]),
+        AppState::CpeLoading { query, .. } => Line::from(vec![
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+            Span::styled("product search: ", Style::default().fg(C_HEADER)),
+            Span::styled(query.as_str(), Style::default().fg(C_DEFAULT)),
+            Span::styled("  searching...", Style::default().fg(C_DIM)),
+        ]),
+        AppState::CpeResults { query, overlay, .. } => Line::from(vec![
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+            Span::styled("product search: ", Style::default().fg(C_HEADER)),
+            Span::styled(query.as_str(), Style::default().fg(C_DEFAULT)),
+            Span::styled(
+                format!("  {} selected", overlay.checked.iter().filter(|&&c| c).count()),
+                Style::default().fg(C_HEADER),
+            ),
+            Span::styled(
+                "  [Space] toggle  [Enter] load CVEs  [/] filter  [Esc] back",
+                Style::default().fg(C_DIM),
+            ),
         ]),
         AppState::Error(_) => Line::from(vec![
             Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
@@ -1096,9 +1448,25 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // ── Body ────────────────────────────────────────────────────────────────
     match &mut app.state {
-        AppState::QueryInput { input } => {
-            render_query_input(f, layout[1], input);
-            return;
+        AppState::QueryInput { input, mode } => {
+            render_query_input(f, layout[1], input, *mode);
+            break 'draw;
+        }
+        AppState::CpeLoading { tick, .. } => {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let frame = frames[(*tick as usize / 3) % frames.len()];
+            let query = if let AppState::CpeLoading { query, .. } = &app.state { query.as_str() } else { "" };
+            let text = format!(
+                "\n\n   {} Searching NVD product database for \"{}\"...\n\n   This may take a moment.",
+                frame, query
+            );
+            f.render_widget(Paragraph::new(text).style(Style::default().fg(C_BLUE)), layout[1]);
+            break 'draw;
+        }
+        AppState::CpeResults { overlay, status_line, .. } => {
+            let status = status_line.clone();
+            render_cpe_results(f, layout[1], overlay, &status);
+            break 'draw;
         }
         AppState::Loading { tick } => {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1142,7 +1510,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 if *filter_open {
                     render_filter_overlay(f, area, filter_overlay);
                 }
-                return;
+                break 'draw;
             }
 
             if *preview_open {
@@ -1165,6 +1533,12 @@ fn ui(f: &mut Frame, app: &mut App) {
                 render_search_overlay(f, area, input, &app.query.clone());
             }
         }
+    }
+
+    } // end 'draw block
+
+    if app.show_about {
+        render_about_overlay(f, area);
     }
 }
 
@@ -1552,8 +1926,8 @@ fn render_search_overlay(f: &mut Frame, area: Rect, input: &str, prev_query: &st
     );
 }
 
-fn render_query_input(f: &mut Frame, area: Rect, input: &str) {
-    let box_area = centered_rect(60, 40, area);
+fn render_query_input(f: &mut Frame, area: Rect, input: &str, mode: SearchMode) {
+    let box_area = centered_rect(60, 50, area);
     f.render_widget(Clear, box_area);
 
     let block = Block::default()
@@ -1573,49 +1947,60 @@ fn render_query_input(f: &mut Frame, area: Rect, input: &str) {
             Constraint::Min(1),    // spacer top
             Constraint::Length(1), // subtitle
             Constraint::Length(1), // spacer
+            Constraint::Length(1), // mode toggle
+            Constraint::Length(1), // spacer
             Constraint::Length(1), // input label
-            Constraint::Length(3), // input field (border top + content + border bottom)
+            Constraint::Length(3), // input field
             Constraint::Length(1), // spacer
             Constraint::Length(1), // hint
             Constraint::Min(1),    // spacer bottom
         ])
         .split(inner);
 
-    // Subtitle
-    let subtitle = Line::from(Span::styled(
-        "NVD Vulnerability Search",
-        Style::default().fg(C_DIM),
-    ));
     f.render_widget(
-        Paragraph::new(subtitle).alignment(ratatui::layout::Alignment::Center),
+        Paragraph::new(Line::from(Span::styled(
+            "NVD Vulnerability Search",
+            Style::default().fg(C_DIM),
+        ))).alignment(ratatui::layout::Alignment::Center),
         chunks[1],
     );
 
-    // Input label
+    // Mode toggle: [● Keyword] / Product  or  Keyword / [● Product]
+    let (kw_style, cpe_style) = if mode == SearchMode::Keyword {
+        (
+            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            Style::default().fg(C_DIM),
+        )
+    } else {
+        (
+            Style::default().fg(C_DIM),
+            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+    };
+    let mode_line = Line::from(vec![
+        Span::styled(" Keyword ", kw_style),
+        Span::styled("  /  ", Style::default().fg(C_DIM)),
+        Span::styled(" Product (CPE) ", cpe_style),
+        Span::styled("   [Tab] switch", Style::default().fg(C_DIM)),
+    ]);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "Search query:",
-            Style::default().fg(C_HEADER),
-        ))),
+        Paragraph::new(mode_line).alignment(ratatui::layout::Alignment::Center),
         chunks[3],
     );
 
-    // Input field with cursor block
-    let display_input = format!("{}\u{2588}", input); // append block cursor █
+    let label = if mode == SearchMode::Keyword { "Keyword search:" } else { "Product / vendor:" };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            display_input,
-            Style::default().fg(C_DEFAULT),
-        )))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(C_BORDER)),
-        ),
-        chunks[4],
+        Paragraph::new(Line::from(Span::styled(label, Style::default().fg(C_HEADER)))),
+        chunks[5],
     );
 
-    // Hint
+    let display_input = format!("{}\u{2588}", input);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(display_input, Style::default().fg(C_DEFAULT))))
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(C_BORDER))),
+        chunks[6],
+    );
+
     let hint = Line::from(vec![
         Span::styled("[Enter]", Style::default().fg(C_YELLOW)),
         Span::styled(" search  ", Style::default().fg(C_DIM)),
@@ -1624,8 +2009,137 @@ fn render_query_input(f: &mut Frame, area: Rect, input: &str) {
     ]);
     f.render_widget(
         Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center),
-        chunks[6],
+        chunks[8],
     );
+}
+
+fn render_cpe_results(f: &mut Frame, area: Rect, overlay: &mut CpeOverlay, status_line: &str) {
+    let popup_area = centered_rect(72, 82, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_HEADER))
+        .title(Span::styled(
+            " Product Search ",
+            Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    if inner.height < 6 || inner.width < 20 { return; }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hints
+            Constraint::Length(1), // search bar
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // separator
+            Constraint::Length(1), // status + confirm
+        ])
+        .split(inner);
+
+    // Hint line
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("[a]", Style::default().fg(C_YELLOW)),
+        Span::styled(" all  ", Style::default().fg(C_DIM)),
+        Span::styled("[n]", Style::default().fg(C_YELLOW)),
+        Span::styled(" none  ", Style::default().fg(C_DIM)),
+        Span::styled("[Space]", Style::default().fg(C_YELLOW)),
+        Span::styled(" toggle  ", Style::default().fg(C_DIM)),
+        Span::styled("[/]", Style::default().fg(C_YELLOW)),
+        Span::styled(" filter  ", Style::default().fg(C_DIM)),
+        Span::styled("[Enter]", Style::default().fg(C_YELLOW)),
+        Span::styled(" load CVEs  ", Style::default().fg(C_DIM)),
+        Span::styled("[Esc]", Style::default().fg(C_YELLOW)),
+        Span::styled(" back", Style::default().fg(C_DIM)),
+    ])), chunks[0]);
+
+    // Search bar
+    let search_line = if overlay.search_mode {
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(overlay.search_query.as_str(), Style::default().fg(C_DEFAULT)),
+            Span::styled("█", Style::default().fg(C_DIM)),
+        ])
+    } else if !overlay.search_query.is_empty() {
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(C_DIM)),
+            Span::styled(overlay.search_query.as_str(), Style::default().fg(C_YELLOW)),
+            Span::styled("  [/] edit  [Esc] clear", Style::default().fg(C_DIM)),
+        ])
+    } else {
+        Line::from(Span::styled("[/] filter products", Style::default().fg(C_DIM)))
+    };
+    f.render_widget(Paragraph::new(search_line), chunks[1]);
+
+    let sep = "─".repeat(inner.width as usize);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(sep.as_str(), Style::default().fg(C_BORDER)))), chunks[2]);
+
+    // Product list
+    if overlay.entries.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  No products found. Press Esc to go back.",
+                Style::default().fg(C_DIM),
+            ))),
+            chunks[3],
+        );
+    } else {
+        let visible_height = chunks[3].height as usize;
+        overlay.adjust_scroll(visible_height);
+        let vis_items = overlay.visible_items();
+        let total_vis = vis_items.len();
+        let scroll_offset = overlay.list_scroll;
+
+        let mut lines: Vec<Line> = vec![];
+        let end = (scroll_offset + visible_height).min(total_vis);
+        for vis_idx in scroll_offset..end {
+            let is_cursor = vis_idx == overlay.cursor;
+            let real = vis_items[vis_idx];
+            let entry = &overlay.entries[real];
+            let checked = overlay.checked[real];
+
+            let prefix    = if is_cursor { "▶ " } else { "  " };
+            let checkbox  = if checked { "[x] " } else { "[ ] " };
+            let row_style = if is_cursor {
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_DEFAULT)
+            };
+            let check_style = if checked { Style::default().fg(Color::Green) } else { Style::default().fg(C_DIM) };
+            let label = entry.display_label();
+            let max_label = chunks[3].width.saturating_sub(13) as usize; // prefix+badge+checkbox
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), row_style),
+                Span::styled(entry.kind.badge(), Style::default().fg(entry.kind.badge_color())),
+                Span::styled(" ", Style::default()),
+                Span::styled(checkbox.to_string(), check_style),
+                Span::styled(truncate_str(&label, max_label), row_style),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), chunks[3]);
+    }
+
+    f.render_widget(Paragraph::new(Line::from(Span::styled(sep.as_str(), Style::default().fg(C_BORDER)))), chunks[4]);
+
+    // Status + confirm button
+    let selected_count = overlay.checked.iter().filter(|&&c| c).count();
+    let status_text = format!("{}  •  {} selected", status_line, selected_count);
+    let (confirm_label, confirm_style) = if overlay.has_selection() {
+        ("[ Load CVEs ]", Style::default().fg(Color::Black).bg(C_HEADER).add_modifier(Modifier::BOLD))
+    } else {
+        ("  Load CVEs  ", Style::default().fg(C_DIM))
+    };
+    let pad = (inner.width as usize).saturating_sub(status_text.len() + confirm_label.len());
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(status_text, Style::default().fg(C_DIM)),
+        Span::styled(" ".repeat(pad), Style::default()),
+        Span::styled(confirm_label, confirm_style),
+    ])), chunks[5]);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1645,6 +2159,53 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn render_about_overlay(f: &mut Frame, area: Rect) {
+    let popup_area = centered_rect(50, 50, area);
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let version = env!("CARGO_PKG_VERSION");
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("v{}", version), Style::default().fg(C_DIM)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  A fast, keyboard-driven terminal UI for searching",
+            Style::default().fg(C_DEFAULT),
+        )),
+        Line::from(Span::styled(
+            "  and browsing CVE vulnerabilities via the NIST NVD API.",
+            Style::default().fg(C_DEFAULT),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  © 2026  ", Style::default().fg(C_DIM)),
+            Span::styled("Christian Lepuschitz", Style::default().fg(C_YELLOW)),
+            Span::styled(" (@xtncl)", Style::default().fg(C_DIM)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("https://github.com/xtncl/cveseek", Style::default().fg(C_BLUE)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().fg(C_DIM),
+        )),
+        Line::from(""),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_BLUE))
+        .title(Span::styled(" About ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)));
+
+    f.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
 fn render_filter_overlay(f: &mut Frame, area: Rect, overlay: &mut FilterOverlay) {
@@ -1757,12 +2318,16 @@ fn render_filter_overlay(f: &mut Frame, area: Rect, overlay: &mut FilterOverlay)
             Style::default().fg(C_DIM)
         };
 
+        let kind = if real < overlay.kinds.len() { &overlay.kinds[real] } else { &CpeType::Unknown };
+        let badge = kind.badge();
+        let badge_color = kind.badge_color();
+        let max_w = chunks[3].width.saturating_sub(6 + badge.len() as u16 + 1) as usize;
+
         // Highlight matching part of label when searching
         if !overlay.search_query.is_empty() && !is_cursor {
             let q = overlay.search_query.to_lowercase();
             let label_lower = label.to_lowercase();
             if let Some(pos) = label_lower.find(&q) {
-                let max_w = chunks[3].width.saturating_sub(6) as usize;
                 let before = truncate_str(&label[..pos], max_w);
                 let matched = &label[pos..pos + q.len()];
                 let after_start = pos + q.len();
@@ -1774,6 +2339,8 @@ fn render_filter_overlay(f: &mut Frame, area: Rect, overlay: &mut FilterOverlay)
                 lines.push(Line::from(vec![
                     Span::styled(prefix.to_string(), row_style),
                     Span::styled(checkbox.to_string(), check_style),
+                    Span::styled(badge, Style::default().fg(badge_color)),
+                    Span::styled(" ", Style::default()),
                     Span::styled(before, Style::default().fg(C_DEFAULT)),
                     Span::styled(matched.to_string(), Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
                     Span::styled(after, Style::default().fg(C_DEFAULT)),
@@ -1785,10 +2352,9 @@ fn render_filter_overlay(f: &mut Frame, area: Rect, overlay: &mut FilterOverlay)
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), row_style),
             Span::styled(checkbox.to_string(), check_style),
-            Span::styled(
-                truncate_str(label, chunks[3].width.saturating_sub(6) as usize),
-                row_style,
-            ),
+            Span::styled(badge, Style::default().fg(badge_color)),
+            Span::styled(" ", Style::default()),
+            Span::styled(truncate_str(label, max_w), row_style),
         ]));
     }
     f.render_widget(Paragraph::new(lines), chunks[3]);
@@ -1867,23 +2433,115 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press { continue; }
+
+                // ── About overlay (highest priority) ─────────────────────────
+                if app.show_about {
+                    app.show_about = false;
+                    continue;
+                }
+                if key.code == KeyCode::Char('?') {
+                    app.show_about = true;
+                    continue;
+                }
+
                 // ── Query input screen ───────────────────────────────────────
-                if let AppState::QueryInput { input } = &mut app.state {
+                if let AppState::QueryInput { input, mode } = &mut app.state {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char(c) => {
-                            input.push(c);
+                        KeyCode::Tab => {
+                            *mode = if *mode == SearchMode::Keyword { SearchMode::Cpe } else { SearchMode::Keyword };
                         }
-                        KeyCode::Backspace => {
-                            input.pop();
-                        }
+                        KeyCode::Char(c) => { input.push(c); }
+                        KeyCode::Backspace => { input.pop(); }
                         KeyCode::Enter => {
                             let q = input.trim().to_string();
                             if !q.is_empty() {
-                                app.submit_query(q);
+                                let m = *mode;
+                                if m == SearchMode::Keyword { app.submit_query(q); }
+                                else { app.submit_cpe_search(q); }
                             }
                         }
                         _ => {}
+                    }
+                    continue;
+                }
+
+                // ── CPE results screen ───────────────────────────────────────
+                if matches!(&app.state, AppState::CpeLoading { .. }) {
+                    if let (KeyCode::Char('c'), KeyModifiers::CONTROL) = (key.code, key.modifiers) { break; }
+                    continue;
+                }
+                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                    if overlay.search_mode {
+                        match key.code {
+                            KeyCode::Esc        => overlay.exit_search(true),
+                            KeyCode::Enter      => overlay.exit_search(false),
+                            KeyCode::Backspace  => overlay.search_pop(),
+                            KeyCode::Up         => overlay.move_cursor(-1),
+                            KeyCode::Down       => overlay.move_cursor(1),
+                            KeyCode::Char(c)    => overlay.search_push(c),
+                            _ => {}
+                        }
+                    } else {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
+                                app.state = AppState::QueryInput {
+                                    input: String::new(), mode: SearchMode::Cpe,
+                                };
+                            }
+                            (KeyCode::Char('/'), _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.enter_search();
+                                }
+                            }
+                            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.move_cursor(-1);
+                                }
+                            }
+                            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.move_cursor(1);
+                                }
+                            }
+                            (KeyCode::PageUp, _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.move_cursor(-15);
+                                }
+                            }
+                            (KeyCode::PageDown, _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.move_cursor(15);
+                                }
+                            }
+                            (KeyCode::Char(' '), _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.toggle_current();
+                                }
+                            }
+                            (KeyCode::Char('a'), _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.select_all();
+                                }
+                            }
+                            (KeyCode::Char('n'), _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    overlay.select_none();
+                                }
+                            }
+                            (KeyCode::Enter, _) => {
+                                if let AppState::CpeResults { overlay, .. } = &mut app.state {
+                                    if overlay.has_selection() {
+                                        let names = overlay.selected_cpe_names();
+                                        let label = build_cpe_label(overlay);
+                                        app.submit_cpe_query(names, label);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     continue;
                 }
