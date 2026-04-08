@@ -3,7 +3,10 @@
 Cargo.lock
 
 # Compiled binary
-cvesearch
+cveseek
 
 # Data files
 *.json
+
+# Private planning notes (not for GitHub)
+plan/

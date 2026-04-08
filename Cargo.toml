@@ -1,11 +1,21 @@
 [package]
-name = "cvesearch"
+name = "cveseek"
 version = "0.1.0"
 edition = "2021"
+description = "A fast terminal UI for searching and browsing CVE vulnerabilities via the NIST NVD API"
+license = "MIT"
+repository = "https://github.com/xtncl/cveseek"
+keywords = ["cve", "nvd", "security", "tui", "vulnerability"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [[bin]]
-name = "cvesearch"
+name = "cveseek"
 path = "src/main.rs"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [dependencies]
 ratatui = "0.26"

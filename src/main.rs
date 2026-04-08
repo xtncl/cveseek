@@ -21,7 +21,7 @@ use serde::Deserialize;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 struct Cli {
-    query: String,
+    query: Option<String>,
     key: String,
 }
 
@@ -45,8 +45,8 @@ impl Cli {
                     }
                 }
                 "-h" | "--help" => {
-                    eprintln!("Usage: cvesearch -q <search term> [-k <nvd-api-key>]");
-                    eprintln!("  -q, --query  Search query (required)");
+                    eprintln!("Usage: cveseek [-q <search term>] [-k <nvd-api-key>]");
+                    eprintln!("  -q, --query  Search query (optional; interactive if omitted)");
                     eprintln!("  -k, --key    NVD API key (optional; also $NVD_API_KEY)");
                     std::process::exit(0);
                 }
@@ -54,12 +54,6 @@ impl Cli {
             }
             i += 1;
         }
-
-        let query = query.unwrap_or_else(|| {
-            eprintln!("Error: -q <query> is required.");
-            eprintln!("Usage: cvesearch -q \"Windows Server 2016\"");
-            std::process::exit(1);
-        });
 
         Cli { query, key }
     }
@@ -660,7 +654,11 @@ impl FilterOverlay {
 
 // ── App State ─────────────────────────────────────────────────────────────────
 
+#[derive(PartialEq, Clone, Copy)]
+enum PaneFocus { List, Preview }
+
 enum AppState {
+    QueryInput { input: String },
     Loading { tick: u8 },
     Error(String),
     Loaded {
@@ -671,6 +669,9 @@ enum AppState {
         preview_scroll: u16,
         filter_overlay: FilterOverlay,
         filter_open: bool,
+        focus: PaneFocus,
+        preview_open: bool,
+        search_input: Option<String>,
     },
 }
 
@@ -680,27 +681,56 @@ enum FetchMsg {
 
 struct App {
     query: String,
+    api_key: String,
     state: AppState,
-    rx: mpsc::Receiver<FetchMsg>,
+    rx: Option<mpsc::Receiver<FetchMsg>>,
 }
 
 impl App {
+    /// Start with a known query (e.g. from -q flag).
     fn new(query: String, api_key: String) -> Self {
         let (tx, rx) = mpsc::channel();
         let q = query.clone();
+        let k = api_key.clone();
         thread::spawn(move || {
-            let result = fetch_cves(&q, &api_key);
+            let result = fetch_cves(&q, &k);
             let _ = tx.send(FetchMsg::Done(result));
         });
         App {
             query,
+            api_key,
             state: AppState::Loading { tick: 0 },
-            rx,
+            rx: Some(rx),
         }
     }
 
+    /// Start interactively: show the query input screen first.
+    fn new_interactive(api_key: String) -> Self {
+        App {
+            query: String::new(),
+            api_key,
+            state: AppState::QueryInput { input: String::new() },
+            rx: None,
+        }
+    }
+
+    /// Submit the query typed in the interactive input screen.
+    fn submit_query(&mut self, query: String) {
+        let (tx, rx) = mpsc::channel();
+        let q = query.clone();
+        let k = self.api_key.clone();
+        thread::spawn(move || {
+            let result = fetch_cves(&q, &k);
+            let _ = tx.send(FetchMsg::Done(result));
+        });
+        self.query = query;
+        self.state = AppState::Loading { tick: 0 };
+        self.rx = Some(rx);
+    }
+
     fn poll_fetch(&mut self) {
-        if let Ok(FetchMsg::Done(result)) = self.rx.try_recv() {
+        if let Some(rx) = &self.rx {
+        if let Ok(FetchMsg::Done(result)) = rx.try_recv() {
             match result {
                 Ok((mut all_cves, total)) => {
                     // Newest published date first
@@ -720,12 +750,16 @@ impl App {
                         preview_scroll: 0,
                         filter_overlay,
                         filter_open: false,
+                        focus: PaneFocus::List,
+                        preview_open: true,
+                        search_input: None,
                     };
                 }
                 Err(e) => {
                     self.state = AppState::Error(e);
                 }
             }
+        }
         }
     }
 
@@ -916,6 +950,53 @@ impl App {
             *preview_scroll = 0;
         }
     }
+
+    fn focus_list(&mut self) {
+        if let AppState::Loaded { focus, .. } = &mut self.state {
+            *focus = PaneFocus::List;
+        }
+    }
+
+    fn focus_preview(&mut self) {
+        if let AppState::Loaded { focus, preview_open, .. } = &mut self.state {
+            if *preview_open {
+                *focus = PaneFocus::Preview;
+            }
+        }
+    }
+
+    fn toggle_preview(&mut self) {
+        if let AppState::Loaded { preview_open, focus, .. } = &mut self.state {
+            *preview_open = !*preview_open;
+            if !*preview_open {
+                *focus = PaneFocus::List;
+            }
+        }
+    }
+
+    fn reopen_search(&mut self) {
+        if let AppState::Loaded { search_input, .. } = &mut self.state {
+            *search_input = Some(String::new());
+        }
+    }
+
+    fn close_search_input(&mut self) {
+        if let AppState::Loaded { search_input, .. } = &mut self.state {
+            *search_input = None;
+        }
+    }
+
+    fn search_input_push(&mut self, c: char) {
+        if let AppState::Loaded { search_input: Some(s), .. } = &mut self.state {
+            s.push(c);
+        }
+    }
+
+    fn search_input_pop(&mut self) {
+        if let AppState::Loaded { search_input: Some(s), .. } = &mut self.state {
+            s.pop();
+        }
+    }
 }
 
 // ── Fetch + Helpers ───────────────────────────────────────────────────────────
@@ -941,7 +1022,7 @@ fn fetch_cves(query: &str, api_key: &str) -> Result<(Vec<VulnEntry>, u32), Strin
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}",
         encoded
     );
-    let mut req = ureq::get(&url).set("User-Agent", "cvesearch/1.0");
+    let mut req = ureq::get(&url).set("User-Agent", "cveseek/1.0");
     if !api_key.is_empty() {
         req = req.set("apiKey", api_key);
     }
@@ -978,19 +1059,23 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // ── Header bar ──────────────────────────────────────────────────────────
     let header_text = match &app.state {
+        AppState::QueryInput { .. } => Line::from(vec![
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+            Span::styled("NVD Vulnerability Search", Style::default().fg(C_DIM)),
+        ]),
         AppState::Loading { .. } => Line::from(vec![
-            Span::styled("  cvesearch ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
             Span::styled("query: ", Style::default().fg(C_HEADER)),
             Span::styled(app.query.as_str(), Style::default().fg(C_DEFAULT)),
             Span::styled("  fetching...", Style::default().fg(C_DIM)),
         ]),
         AppState::Error(_) => Line::from(vec![
-            Span::styled("  cvesearch ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
             Span::styled("  error  ", Style::default().fg(Color::Rgb(251, 73, 52))),
             Span::styled("  [q] quit", Style::default().fg(C_DIM)),
         ]),
-        AppState::Loaded { cves, total, .. } => Line::from(vec![
-            Span::styled("  cvesearch ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
+        AppState::Loaded { cves, total, focus, preview_open, .. } => Line::from(vec![
+            Span::styled("  cveseek ", Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD)),
             Span::styled("query: ", Style::default().fg(C_HEADER)),
             Span::styled(app.query.as_str(), Style::default().fg(C_DEFAULT)),
             Span::styled(
@@ -998,7 +1083,11 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Style::default().fg(C_HEADER),
             ),
             Span::styled(
-                "  [↑↓/jk] nav  [PgUp/PgDn] page  [g/G] top/bot  [^d/^u] scroll preview  [f] filter  [q] quit",
+                if *preview_open && *focus == PaneFocus::Preview {
+                    "  [↑↓] scroll  [←] list  [Enter] hide preview  [f] filter  [s] search  [q] quit"
+                } else {
+                    "  [↑↓/jk] nav  [→] preview  [Enter] toggle preview  [f] filter  [s] search  [q] quit"
+                },
                 Style::default().fg(C_DIM),
             ),
         ]),
@@ -1007,6 +1096,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // ── Body ────────────────────────────────────────────────────────────────
     match &mut app.state {
+        AppState::QueryInput { input } => {
+            render_query_input(f, layout[1], input);
+            return;
+        }
         AppState::Loading { tick } => {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let frame = frames[(*tick as usize / 3) % frames.len()];
@@ -1032,6 +1125,9 @@ fn ui(f: &mut Frame, app: &mut App) {
             preview_scroll,
             filter_open,
             filter_overlay,
+            focus,
+            preview_open,
+            search_input,
             ..
         } => {
             if cves.is_empty() {
@@ -1049,16 +1145,24 @@ fn ui(f: &mut Frame, app: &mut App) {
                 return;
             }
 
-            let body_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                .split(layout[1]);
-
-            render_list(f, body_chunks[0], cves, table_state);
-            render_preview(f, body_chunks[1], cves, table_state.selected(), *preview_scroll);
+            if *preview_open {
+                let body_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(layout[1]);
+                render_list(f, body_chunks[0], cves, table_state,
+                    *focus == PaneFocus::List, true);
+                render_preview(f, body_chunks[1], cves, table_state.selected(),
+                    *preview_scroll, *focus == PaneFocus::Preview);
+            } else {
+                render_list(f, layout[1], cves, table_state, true, false);
+            }
 
             if *filter_open {
                 render_filter_overlay(f, area, filter_overlay);
+            }
+            if let Some(input) = search_input {
+                render_search_overlay(f, area, input, &app.query.clone());
             }
         }
     }
@@ -1066,27 +1170,39 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_list(
     f: &mut Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     cves: &[VulnEntry],
     table_state: &mut TableState,
+    active: bool,
+    preview_open: bool,
 ) {
+    let border_color = if active { C_HEADER } else { C_BORDER };
+    let title_style  = if active {
+        Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(C_DIM)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BORDER))
-        .title(Span::styled(
-            " CVE List ",
-            Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(" CVE List ", title_style));
 
-    let header_cells = ["CVE ID", "SEVERITY", "DESCRIPTION"]
-        .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(C_HEADER)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
-        });
+    // Extra columns shown when preview is hidden, depending on terminal width.
+    let show_published = !preview_open && area.width >= 85;
+    let show_modified  = !preview_open && area.width >= 103;
+    let show_status    = !preview_open && area.width >= 125;
+
+    let mut col_names: Vec<&str> = vec!["CVE ID", "SEV", "DESCRIPTION"];
+    if show_published { col_names.push("PUBLISHED"); }
+    if show_modified  { col_names.push("MODIFIED"); }
+    if show_status    { col_names.push("STATUS"); }
+
+    let header_cells = col_names.iter().map(|h| {
+        Cell::from(*h).style(
+            Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+    });
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = cves
@@ -1097,33 +1213,41 @@ fn render_list(
             let desc = english_desc(&cve.descriptions);
             let sev_color = severity_color(&sev.label);
 
-            let id_cell = Cell::from(cve.id.clone()).style(Style::default().fg(C_BLUE));
-            let sev_cell = Cell::from(sev.label).style(
-                Style::default()
-                    .fg(sev_color)
-                    .add_modifier(Modifier::BOLD),
-            );
-            let desc_cell =
-                Cell::from(truncate_str(&strip_html(desc), 120)).style(Style::default().fg(C_DEFAULT));
-
-            Row::new(vec![id_cell, sev_cell, desc_cell]).height(1)
+            let mut cells = vec![
+                Cell::from(cve.id.clone()).style(Style::default().fg(C_BLUE)),
+                Cell::from(sev.label).style(Style::default().fg(sev_color).add_modifier(Modifier::BOLD)),
+                Cell::from(truncate_str(&strip_html(desc), 120)).style(Style::default().fg(C_DEFAULT)),
+            ];
+            if show_published {
+                cells.push(Cell::from(short_date(&cve.published).to_string())
+                    .style(Style::default().fg(C_DIM)));
+            }
+            if show_modified {
+                cells.push(Cell::from(short_date(&cve.last_modified).to_string())
+                    .style(Style::default().fg(C_DIM)));
+            }
+            if show_status {
+                cells.push(Cell::from(truncate_str(&cve.vuln_status, 18))
+                    .style(Style::default().fg(C_DIM)));
+            }
+            Row::new(cells).height(1)
         })
         .collect();
 
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(20),
-        Constraint::Length(10),
+        Constraint::Length(9),
         Constraint::Fill(1),
     ];
+    if show_published { widths.push(Constraint::Length(12)); }
+    if show_modified  { widths.push(Constraint::Length(12)); }
+    if show_status    { widths.push(Constraint::Length(18)); }
 
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
         .highlight_style(
-            Style::default()
-                .bg(C_SEL_BG)
-                .fg(C_YELLOW)
-                .add_modifier(Modifier::BOLD),
+            Style::default().bg(C_SEL_BG).fg(C_YELLOW).add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
 
@@ -1132,18 +1256,22 @@ fn render_list(
 
 fn render_preview(
     f: &mut Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     cves: &[VulnEntry],
     selected: Option<usize>,
     scroll: u16,
+    active: bool,
 ) {
+    let border_color = if active { C_HEADER } else { C_BORDER };
+    let title_style  = if active {
+        Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(C_DIM)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BORDER))
-        .title(Span::styled(
-            " Preview ",
-            Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(" Preview ", title_style));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1359,6 +1487,145 @@ fn render_preview(
 
     let paragraph = Paragraph::new(lines).scroll((scroll, 0));
     f.render_widget(paragraph, inner);
+}
+
+fn render_search_overlay(f: &mut Frame, area: Rect, input: &str, prev_query: &str) {
+    let popup_area = centered_rect(58, 38, area);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_HEADER))
+        .title(Span::styled(
+            " New Search ",
+            Style::default().fg(C_HEADER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1), // prev query hint
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // input (border + content + border)
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // hint
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    // Previous query (grayed out)
+    if !prev_query.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Current:  ", Style::default().fg(C_DIM)),
+                Span::styled(prev_query, Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC)),
+            ])),
+            chunks[1],
+        );
+    }
+
+    // Input field with block cursor
+    let display = format!("{}\u{2588}", input);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(display, Style::default().fg(C_DEFAULT))))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(C_BORDER)),
+            ),
+        chunks[3],
+    );
+
+    // Hint
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("[Enter]", Style::default().fg(C_YELLOW)),
+            Span::styled(" search  ", Style::default().fg(C_DIM)),
+            Span::styled("[Esc/q]", Style::default().fg(C_YELLOW)),
+            Span::styled(" cancel", Style::default().fg(C_DIM)),
+        ]))
+        .alignment(ratatui::layout::Alignment::Center),
+        chunks[5],
+    );
+}
+
+fn render_query_input(f: &mut Frame, area: Rect, input: &str) {
+    let box_area = centered_rect(60, 40, area);
+    f.render_widget(Clear, box_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_HEADER))
+        .title(Span::styled(
+            " cveseek ",
+            Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // spacer top
+            Constraint::Length(1), // subtitle
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // input label
+            Constraint::Length(3), // input field (border top + content + border bottom)
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // hint
+            Constraint::Min(1),    // spacer bottom
+        ])
+        .split(inner);
+
+    // Subtitle
+    let subtitle = Line::from(Span::styled(
+        "NVD Vulnerability Search",
+        Style::default().fg(C_DIM),
+    ));
+    f.render_widget(
+        Paragraph::new(subtitle).alignment(ratatui::layout::Alignment::Center),
+        chunks[1],
+    );
+
+    // Input label
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Search query:",
+            Style::default().fg(C_HEADER),
+        ))),
+        chunks[3],
+    );
+
+    // Input field with cursor block
+    let display_input = format!("{}\u{2588}", input); // append block cursor █
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            display_input,
+            Style::default().fg(C_DEFAULT),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(C_BORDER)),
+        ),
+        chunks[4],
+    );
+
+    // Hint
+    let hint = Line::from(vec![
+        Span::styled("[Enter]", Style::default().fg(C_YELLOW)),
+        Span::styled(" search  ", Style::default().fg(C_DIM)),
+        Span::styled("[Esc/q]", Style::default().fg(C_YELLOW)),
+        Span::styled(" quit", Style::default().fg(C_DIM)),
+    ]);
+    f.render_widget(
+        Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center),
+        chunks[6],
+    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1585,7 +1852,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(cli.query, cli.key);
+    let mut app = match cli.query {
+        Some(q) => App::new(q, cli.key),
+        None    => App::new_interactive(cli.key),
+    };
 
     let tick_rate = Duration::from_millis(50);
 
@@ -1597,6 +1867,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
+                // ── Query input screen ───────────────────────────────────────
+                if let AppState::QueryInput { input } = &mut app.state {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char(c) => {
+                            input.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            input.pop();
+                        }
+                        KeyCode::Enter => {
+                            let q = input.trim().to_string();
+                            if !q.is_empty() {
+                                app.submit_query(q);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // ── Search overlay (s key) ───────────────────────────────────
+                let search_overlay_open =
+                    matches!(&app.state, AppState::Loaded { search_input: Some(_), .. });
+                if search_overlay_open {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => app.close_search_input(),
+                        KeyCode::Backspace => app.search_input_pop(),
+                        KeyCode::Char(c) => app.search_input_push(c),
+                        KeyCode::Enter => {
+                            let q = if let AppState::Loaded { search_input: Some(s), .. } = &app.state {
+                                s.trim().to_string()
+                            } else { String::new() };
+                            if !q.is_empty() { app.submit_query(q); }
+                            else             { app.close_search_input(); }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 let filter_open =
                     matches!(&app.state, AppState::Loaded { filter_open: true, .. });
                 let search_mode = if let AppState::Loaded { filter_open: true, filter_overlay, .. } =
@@ -1619,16 +1930,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else if filter_open {
                     match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), _)
-                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                        (KeyCode::Esc, _) | (KeyCode::Char('f'), _) => app.toggle_filter(),
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                        (KeyCode::Esc, _)
+                        | (KeyCode::Char('f'), _)
+                        | (KeyCode::Char('q'), _) => app.toggle_filter(),
                         (KeyCode::Char('/'), _) => app.filter_search_enter(),
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                            app.filter_move_cursor(-1)
-                        }
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                            app.filter_move_cursor(1)
-                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.filter_move_cursor(-1),
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.filter_move_cursor(1),
+                        (KeyCode::PageUp, _) => app.filter_move_cursor(-15),
+                        (KeyCode::PageDown, _) => app.filter_move_cursor(15),
+                        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.filter_move_cursor(-8),
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.filter_move_cursor(8),
                         (KeyCode::Char(' '), _) => app.filter_toggle(),
                         (KeyCode::Char('a'), _) => app.filter_select_all(),
                         (KeyCode::Char('n'), _) => app.filter_select_none(),
@@ -1637,18 +1949,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                 } else {
+                    // Determine current focus for routing ↑/↓
+                    let in_preview = matches!(&app.state,
+                        AppState::Loaded { focus: PaneFocus::Preview, preview_open: true, .. });
+
                     match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), _)
-                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_cursor(-1),
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_cursor(1),
-                        (KeyCode::PageUp, _) => app.move_cursor(-15),
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+
+                        // q / Esc: close active pane or quit
+                        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                            if in_preview { app.focus_list(); }
+                            else          { break; }
+                        }
+
+                        // Focus switching
+                        (KeyCode::Right, _) => app.focus_preview(),
+                        (KeyCode::Left, _)  => app.focus_list(),
+
+                        // Up/Down routed by focus
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                            if in_preview { app.scroll_preview(-3); }
+                            else          { app.move_cursor(-1); }
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                            if in_preview { app.scroll_preview(3); }
+                            else          { app.move_cursor(1); }
+                        }
+
+                        // List-only navigation
+                        (KeyCode::PageUp, _)   => app.move_cursor(-15),
                         (KeyCode::PageDown, _) => app.move_cursor(15),
                         (KeyCode::Char('g'), _) => app.goto_first(),
                         (KeyCode::Char('G'), _) => app.goto_last(),
+
+                        // Preview scroll (kept for power users)
                         (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.scroll_preview(8),
                         (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.scroll_preview(-8),
+
+                        // Toggle preview pane
+                        (KeyCode::Enter, _) => app.toggle_preview(),
+
+                        // Filter + new search
                         (KeyCode::Char('f'), _) => app.toggle_filter(),
+                        (KeyCode::Char('s'), _) => app.reopen_search(),
+
                         _ => {}
                     }
                 }
