@@ -5,6 +5,7 @@ edition = "2021"
 description = "A fast terminal UI for searching and browsing CVE vulnerabilities via the NIST NVD API"
 license = "MIT"
 repository = "https://github.com/xtncl/cveseek"
+authors = ["Christian Lepuschitz <github.com/xtncl>"]
 keywords = ["cve", "nvd", "security", "tui", "vulnerability"]
 categories = ["command-line-utilities"]
 readme = "README.md"

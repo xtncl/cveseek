@@ -3,6 +3,7 @@
 
 # Compiled binary
 cveseek
+cvesearch
 
 # Data files
 *.json
